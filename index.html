@@ -67,6 +67,15 @@ input, button { transition: background 0.15s, color 0.15s, border-color 0.15s; }
 const { useState, useEffect } = React;
 
 
+// =====================================================================
+// STOCKAI PRO — VERSION
+// Versioning: MAJOR.MINOR.PATCH
+//   PATCH  = bug fixes, small tweaks
+//   MINOR  = new features
+//   MAJOR  = big architectural changes
+// =====================================================================
+const APP_VERSION = "1.0.0";
+
 const SECTORS = [
   { val: "all", label: "כל הסקטורים" },
   { val: "tech", label: "טכנולוגיה" },
@@ -3519,7 +3528,7 @@ function LoginGate({ onSkip }) {
       <div style={{ background: "var(--bg-card)", border: "1px solid var(--border-light)", borderRadius: 16, padding: 28, maxWidth: 400, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.08)" }}>
         <div style={{ textAlign: "center", marginBottom: 24 }}>
           <div style={{ width: 56, height: 56, background: "var(--accent)", borderRadius: 14, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 28, marginBottom: 12 }}>📈</div>
-          <div style={{ fontSize: 22, fontWeight: 700, color: "var(--text-primary)", marginBottom: 4 }}>StockAI Pro</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: "var(--text-primary)", marginBottom: 4 }}>StockAI Pro <span style={{ fontSize: 11, fontWeight: 400, opacity: 0.6 }}>v{APP_VERSION}</span></div>
           <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
             {mode === "signup" ? "צור חשבון חדש" : mode === "reset" ? "איפוס סיסמה" : "התחבר כדי לסנכרן את הנתונים"}
           </div>
@@ -3850,7 +3859,10 @@ function App() {
           <div style={{ width: 38, height: 38, background: darkMode ? "#fff" : "#000", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>📈</div>
           <div>
             <div style={{ fontSize: 18, fontWeight: 600, color: textPrimary }}>StockAI Pro</div>
-            <div style={{ fontSize: 13, color: textSecondary }}>ניתוח מניות בזמן אמת</div>
+            <div style={{ fontSize: 13, color: textSecondary }}>
+              ניתוח מניות בזמן אמת
+              <span style={{ fontSize: 10, color: textSecondary, opacity: 0.7, marginRight: 6 }}>v{APP_VERSION}</span>
+            </div>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
