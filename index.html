@@ -6,8 +6,30 @@
 <title>StockAI Pro</title>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<!-- Use specific Babel Standalone version that supports classic JSX transform -->
 <script src="https://unpkg.com/@babel/standalone@7.23.0/babel.min.js"></script>
+
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+<script>
+  try {
+    if (typeof firebase !== "undefined" && window.location.protocol !== "file:") {
+      const firebaseConfig = {
+        apiKey: "AIzaSyCAMaErhqx2v9ZqadU46wmy30CQRMLpw7w",
+        authDomain: "stockai-e2773.firebaseapp.com",
+        projectId: "stockai-e2773",
+        storageBucket: "stockai-e2773.firebasestorage.app",
+        messagingSenderId: "915254191377",
+        appId: "1:915254191377:web:bdd3894d0165b31140d8b0",
+        measurementId: "G-WYHEK09FB5"
+      };
+      firebase.initializeApp(firebaseConfig);
+    }
+  } catch (e) {
+    console.warn("Firebase init skipped:", e.message);
+  }
+</script>
 
 <style>
 :root {
@@ -124,15 +146,37 @@ function setFinnhubKey(key) {
   localStorage.setItem("finnhub_key", key);
 }
 
-async function finnhubFetch(endpoint, params = {}) {
+async function finnhubFetch(endpoint, params = {}, retries = 2) {
   const key = getFinnhubKey();
   if (!key) throw new Error("NO_FINNHUB_KEY");
   const url = new URL(`${FINNHUB_BASE}${endpoint}`);
   Object.entries(params).forEach(([k, v]) => url.searchParams.append(k, v));
   url.searchParams.append("token", key);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error(`Finnhub ${res.status}`);
-  return res.json();
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url.toString());
+      if (res.status === 429) {
+        // Rate limited - wait and retry
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        throw new Error(`Finnhub rate limit (429). המתן דקה ונסה שוב.`);
+      }
+      if (res.status === 401) {
+        throw new Error(`Finnhub 401: מפתח לא תקין`);
+      }
+      if (!res.ok) throw new Error(`Finnhub ${res.status}`);
+      return res.json();
+    } catch (e) {
+      if (attempt < retries && !e.message.includes("401") && !e.message.includes("NO_FINNHUB_KEY")) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 async function fetchStockData(ticker) {
@@ -181,6 +225,55 @@ async function fetchStockData(ticker) {
   };
 
   localStorage.setItem(cacheKey, JSON.stringify({ data, _ts: Date.now() }));
+  return data;
+}
+
+// Lite version for scanner - only 3 API calls (quote + profile + metrics)
+// Saves 50% of API calls to avoid rate limits during batch scanning
+async function fetchStockDataLite(ticker) {
+  const cacheKey = `finnhub_data_${ticker}`;
+  // Check cache first (uses same cache as full version)
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+    if (cached && Date.now() - cached._ts < 3600000) return cached.data;
+  } catch {}
+
+  const liteCacheKey = `finnhub_lite_${ticker}`;
+  try {
+    const cached = JSON.parse(localStorage.getItem(liteCacheKey) || "null");
+    if (cached && Date.now() - cached._ts < 3600000) return cached.data;
+  } catch {}
+
+  const [quote, profile, metrics] = await Promise.all([
+    finnhubFetch("/quote", { symbol: ticker }),
+    finnhubFetch("/stock/profile2", { symbol: ticker }).catch(() => ({})),
+    finnhubFetch("/stock/metric", { symbol: ticker, metric: "all" }).catch(() => ({})),
+  ]);
+
+  if (!quote.c) throw new Error("no_price");
+
+  const data = {
+    ticker,
+    price: quote.c, change: quote.d, changePercent: quote.dp,
+    high: quote.h, low: quote.l, open: quote.o, prevClose: quote.pc,
+    name: profile.name, industry: profile.finnhubIndustry,
+    marketCap: profile.marketCapitalization, currency: profile.currency,
+    pe: metrics.metric?.peNormalizedAnnual || metrics.metric?.peTTM,
+    pb: metrics.metric?.pbAnnual,
+    eps: metrics.metric?.epsTTM,
+    roe: metrics.metric?.roeTTM,
+    week52High: metrics.metric?.["52WeekHigh"],
+    week52Low: metrics.metric?.["52WeekLow"],
+    beta: metrics.metric?.beta,
+    revenueGrowth: metrics.metric?.revenueGrowthTTMYoy,
+    profitMargin: metrics.metric?.netProfitMarginTTM,
+    newsCount: 0,
+    newsHeadlines: [],
+    insiderSentiment: [],
+    analystRecommendation: null,
+  };
+
+  localStorage.setItem(liteCacheKey, JSON.stringify({ data, _ts: Date.now() }));
   return data;
 }
 
@@ -1508,23 +1601,49 @@ function RadarTab() {
       setProgress(`מנתח ${tickers.length} מניות לפתיחה...`);
 
       const enriched = [];
-      for (let i = 0; i < tickers.length; i += 5) {
-        const batch = tickers.slice(i, i + 5);
-        setProgress(`מנתח ${i + 1}-${Math.min(i + 5, tickers.length)}/${tickers.length}...`);
-        const batchData = await Promise.all(batch.map(async t => {
-          try {
-            const [data, earnings] = await Promise.all([
-              fetchStockData(t),
-              fetchRecentEarnings(t).catch(() => ({ hadEarningsRecently: false })),
-            ]);
-            if (!data.price) return null;
-            const score = computeOpeningScore(data, earnings, ctx);
-            return { ticker: t, data, earnings, score };
-          } catch {
-            return null;
+      const failedR = [];
+      const BATCH_SIZE_R = 3;
+      const BATCH_DELAY_R = 5000;
+
+      const fetchOne = async (t) => {
+        try {
+          const [data, earnings] = await Promise.all([
+            fetchStockData(t),
+            fetchRecentEarnings(t).catch(() => ({ hadEarningsRecently: false })),
+          ]);
+          if (!data.price) return null;
+          const score = computeOpeningScore(data, earnings, ctx);
+          return { ticker: t, data, earnings, score };
+        } catch {
+          return null;
+        }
+      };
+
+      for (let i = 0; i < tickers.length; i += BATCH_SIZE_R) {
+        const batch = tickers.slice(i, i + BATCH_SIZE_R);
+        setProgress(`מנתח ${i + 1}-${Math.min(i + BATCH_SIZE_R, tickers.length)}/${tickers.length}...`);
+        const batchData = await Promise.all(batch.map(fetchOne));
+        batchData.forEach((r, idx) => {
+          if (r) enriched.push(r);
+          else failedR.push(batch[idx]);
+        });
+        if (i + BATCH_SIZE_R < tickers.length) {
+          await new Promise(r => setTimeout(r, BATCH_DELAY_R));
+        }
+      }
+
+      // Retry failed
+      if (failedR.length > 0) {
+        setProgress(`מנסה שוב ${failedR.length} מניות...`);
+        await new Promise(r => setTimeout(r, 3000));
+        for (let i = 0; i < failedR.length; i += BATCH_SIZE_R) {
+          const batch = failedR.slice(i, i + BATCH_SIZE_R);
+          const batchData = await Promise.all(batch.map(fetchOne));
+          batchData.forEach(r => { if (r) enriched.push(r); });
+          if (i + BATCH_SIZE_R < failedR.length) {
+            await new Promise(r => setTimeout(r, BATCH_DELAY_R));
           }
-        }));
-        enriched.push(...batchData.filter(Boolean));
+        }
       }
 
       const top = enriched.sort((a, b) => b.score.total - a.score.total).slice(0, 10);
@@ -1850,36 +1969,75 @@ function ScannerTab({ state, setState }) {
         setProgress(`טוען נתונים על ${tickers.length} מניות מ-Finnhub...`);
 
         const stocksData = [];
-        // Fetch in batches of 5 to respect rate limits (60/min = 1/sec ≈ 5/5sec safe)
-        for (let i = 0; i < tickers.length; i += 5) {
-          const batch = tickers.slice(i, i + 5);
-          setProgress(`טוען מניות ${i + 1}-${Math.min(i + 5, tickers.length)} מתוך ${tickers.length}...`);
-          const batchResults = await Promise.all(
-            batch.map(async t => {
-              try {
-                const data = await fetchStockData(t);
-                if (!data.price) return null;
-                const scores = computeScoresFromData(data);
-                const total = Math.round(
-                  scores.fundamental * 0.20 + scores.technical * 0.35 +
-                  scores.futures * 0.15 + scores.analysts * 0.10 +
-                  scores.news * 0.10 + scores.insider * 0.10
-                );
-                return { ticker: t, data, scores, total };
-              } catch (e) {
-                console.warn(`Failed ${t}:`, e.message);
-                return null;
-              }
-            })
-          );
-          stocksData.push(...batchResults.filter(Boolean));
+        const failedTickers = [];
+
+        const fetchStock = async (t) => {
+          try {
+            const data = await fetchStockDataLite(t);
+            if (!data.price) return null;
+            const scores = computeScoresFromData(data);
+            const total = Math.round(
+              scores.fundamental * 0.20 + scores.technical * 0.35 +
+              scores.futures * 0.15 + scores.analysts * 0.10 +
+              scores.news * 0.10 + scores.insider * 0.10
+            );
+            return { ticker: t, data, scores, total };
+          } catch (e) {
+            console.warn(`Failed ${t}:`, e.message);
+            return null;
+          }
+        };
+
+        // Fetch in batches of 3 with delay (Finnhub free = 60 req/min, 6 endpoints per stock)
+        // 3 stocks * 6 calls = 18 calls per batch. Wait 4s = 18/4 = 4.5/sec = 270/min (over).
+        // Better: 3 stocks per 4 sec = 13.5 calls/sec = 810/min — too many.
+        // Realistic: 3 stocks every 5 seconds = ~10 calls/sec = ~50/min including overhead.
+        const BATCH_SIZE = 3;
+        const BATCH_DELAY = 5000; // 5 seconds between batches
+
+        for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
+          const batch = tickers.slice(i, i + BATCH_SIZE);
+          setProgress(`טוען מניות ${i + 1}-${Math.min(i + BATCH_SIZE, tickers.length)} מתוך ${tickers.length}...`);
+          const batchResults = await Promise.all(batch.map(fetchStock));
+          batchResults.forEach((r, idx) => {
+            if (r) stocksData.push(r);
+            else failedTickers.push(batch[idx]);
+          });
+          // Delay between batches (except after last)
+          if (i + BATCH_SIZE < tickers.length) {
+            await new Promise(r => setTimeout(r, BATCH_DELAY));
+          }
+        }
+
+        // Retry failed tickers once
+        if (failedTickers.length > 0) {
+          setProgress(`מנסה שוב ${failedTickers.length} מניות שנכשלו...`);
+          await new Promise(r => setTimeout(r, 3000)); // wait for rate limit to clear
+          for (let i = 0; i < failedTickers.length; i += BATCH_SIZE) {
+            const batch = failedTickers.slice(i, i + BATCH_SIZE);
+            const batchResults = await Promise.all(batch.map(fetchStock));
+            batchResults.forEach(r => { if (r) stocksData.push(r); });
+            if (i + BATCH_SIZE < failedTickers.length) {
+              await new Promise(r => setTimeout(r, BATCH_DELAY));
+            }
+          }
         }
 
         if (stocksData.length === 0) {
-          setError("לא הצלחתי לטעון נתונים. בדוק את מפתח Finnhub.");
+          // Try to fetch one stock to get the actual error message
+          let realError = "";
+          try {
+            await finnhubFetch("/quote", { symbol: "AAPL" });
+          } catch (e) {
+            realError = e.message;
+          }
+          setError(`לא הצלחתי לטעון נתונים. ${realError ? "שגיאה: " + realError : "בדוק את מפתח Finnhub."}`);
           setLoading(false);
           setProgress("");
           return;
+        }
+        if (stocksData.length < 10) {
+          console.warn(`רק ${stocksData.length} מניות נטענו (במקום ${tickers.length})`);
         }
 
         // Filter by scan type
@@ -3184,9 +3342,269 @@ const TABS = [
   { id: "history", label: "📜 היסטוריה" },
 ];
 
+// =====================================================================
+// FIREBASE AUTHENTICATION & SYNC
+// =====================================================================
+
+// Keys that should sync between devices (per user)
+const SYNC_KEYS = [
+  'stock_history', 'scan_history',
+  'portfolio_stocks', 'watchlist_stocks', 'portfolio_result',
+  'scanner_state', 'radar_results', 'radar_sector', 'portfolio_section',
+  'dark_mode', 'daily_limit',
+  'finnhub_key', 'twelvedata_key', 'anthropic_key',
+];
+
+let _syncTimer = null;
+let _currentUser = null;
+
+// Patch localStorage to auto-sync to Firestore (only if Firebase is available)
+if (typeof window !== 'undefined' && !window._localStoragePatched) {
+  window._localStoragePatched = true;
+  const _setItem = Storage.prototype.setItem;
+  Storage.prototype.setItem = function(key, value) {
+    _setItem.call(this, key, value);
+    if (this === localStorage && SYNC_KEYS.includes(key) && _currentUser && window.firebase) {
+      clearTimeout(_syncTimer);
+      _syncTimer = setTimeout(() => syncToFirestore(_currentUser.uid), 2000);
+    }
+  };
+}
+
+async function syncToFirestore(uid) {
+  if (!window.firebase) return;
+  const data = {};
+  for (const key of SYNC_KEYS) {
+    const value = localStorage.getItem(key);
+    if (value !== null) data[key] = value;
+  }
+  try {
+    await window.firebase.firestore().collection('users').doc(uid).set({
+      data,
+      updatedAt: window.firebase.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (e) {
+    console.error('Sync failed:', e);
+  }
+}
+
+async function loadFromFirestore(uid) {
+  if (!window.firebase) return false;
+  try {
+    const doc = await window.firebase.firestore().collection('users').doc(uid).get();
+    if (doc.exists) {
+      const data = doc.data().data || {};
+      for (const [key, value] of Object.entries(data)) {
+        if (typeof value === 'string') {
+          Storage.prototype.setItem.call(localStorage, key, value);
+        }
+      }
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error('Load failed:', e);
+    return false;
+  }
+}
+
+function translateAuthError(code) {
+  const map = {
+    "auth/invalid-email": "כתובת אימייל לא תקינה",
+    "auth/user-disabled": "המשתמש הזה הושעה",
+    "auth/user-not-found": "לא נמצא משתמש עם האימייל הזה",
+    "auth/wrong-password": "סיסמה שגויה",
+    "auth/invalid-credential": "אימייל או סיסמה שגויים",
+    "auth/email-already-in-use": "כתובת אימייל זו כבר רשומה",
+    "auth/weak-password": "הסיסמה חלשה מדי (לפחות 6 תווים)",
+    "auth/popup-closed-by-user": "ההתחברות בוטלה",
+    "auth/popup-blocked": "החלון נחסם — אפשר חלונות קופצים בדפדפן",
+    "auth/network-request-failed": "אין חיבור לאינטרנט",
+    "auth/too-many-requests": "יותר מדי ניסיונות. נסה שוב מאוחר יותר.",
+    "auth/operation-not-supported-in-this-environment": "Firebase לא תומך ב-file://. פתח דרך GitHub Pages או שרת מקומי.",
+  };
+  return map[code];
+}
+
+function LoginGate({ onSkip }) {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [info, setInfo] = useState(null);
+
+  const handleGoogleSignIn = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const provider = new window.firebase.auth.GoogleAuthProvider();
+      await window.firebase.auth().signInWithPopup(provider);
+    } catch (e) {
+      setError(translateAuthError(e.code) || e.message);
+      setLoading(false);
+    }
+  };
+
+  const handleEmailLogin = async (e) => {
+    e?.preventDefault();
+    if (!email || (mode !== "reset" && !password)) return;
+    setLoading(true);
+    setError(null);
+    try {
+      if (mode === "signup") {
+        await window.firebase.auth().createUserWithEmailAndPassword(email, password);
+      } else if (mode === "reset") {
+        await window.firebase.auth().sendPasswordResetEmail(email);
+        setInfo("✉ אימייל לאיפוס סיסמה נשלח.");
+        setMode("login");
+        setLoading(false);
+        return;
+      } else {
+        await window.firebase.auth().signInWithEmailAndPassword(email, password);
+      }
+    } catch (e) {
+      setError(translateAuthError(e.code) || e.message);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "var(--bg-primary)" }}>
+      <div style={{ background: "var(--bg-card)", border: "1px solid var(--border-light)", borderRadius: 16, padding: 28, maxWidth: 400, width: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.08)" }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <div style={{ width: 56, height: 56, background: "var(--accent)", borderRadius: 14, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 28, marginBottom: 12 }}>📈</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: "var(--text-primary)", marginBottom: 4 }}>StockAI Pro</div>
+          <div style={{ fontSize: 13, color: "var(--text-muted)" }}>
+            {mode === "signup" ? "צור חשבון חדש" : mode === "reset" ? "איפוס סיסמה" : "התחבר כדי לסנכרן את הנתונים"}
+          </div>
+        </div>
+
+        {mode !== "reset" && (
+          <>
+            <button onClick={handleGoogleSignIn} disabled={loading} style={{
+              width: "100%", padding: "11px 16px", fontSize: 14, fontWeight: 500,
+              background: "#fff", color: "#444", border: "1px solid #ddd", borderRadius: 8,
+              cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.5 : 1,
+              fontFamily: "inherit", marginBottom: 14,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+            }}>
+              <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z"/><path fill="#FBBC05" d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957C.347 6.173 0 7.548 0 9s.348 2.827.957 4.042l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/></svg>
+              המשך עם Google
+            </button>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "16px 0", color: "var(--text-muted)", fontSize: 12 }}>
+              <div style={{ flex: 1, height: 1, background: "var(--border-light)" }} />
+              או
+              <div style={{ flex: 1, height: 1, background: "var(--border-light)" }} />
+            </div>
+          </>
+        )}
+
+        <form onSubmit={handleEmailLogin}>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="אימייל" dir="ltr" required
+            style={{ width: "100%", padding: "10px 12px", fontSize: 14, border: "1px solid var(--border)", borderRadius: 8, fontFamily: "inherit", outline: "none", marginBottom: 10, background: "var(--bg-card)", color: "var(--text-primary)" }} />
+          {mode !== "reset" && (
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="סיסמה" dir="ltr" required minLength={6}
+              style={{ width: "100%", padding: "10px 12px", fontSize: 14, border: "1px solid var(--border)", borderRadius: 8, fontFamily: "inherit", outline: "none", marginBottom: 10, background: "var(--bg-card)", color: "var(--text-primary)" }} />
+          )}
+          {error && <div style={{ background: "#fee2e2", color: "#991b1b", fontSize: 12, padding: "8px 10px", borderRadius: 6, marginBottom: 10 }}>{error}</div>}
+          {info && <div style={{ background: "#dcfce7", color: "#166534", fontSize: 12, padding: "8px 10px", borderRadius: 6, marginBottom: 10 }}>{info}</div>}
+          <button type="submit" disabled={loading || !email || (mode !== "reset" && !password)} style={{
+            width: "100%", padding: "10px 16px", fontSize: 14, fontWeight: 500,
+            background: "var(--accent)", color: "var(--accent-text)", border: "none", borderRadius: 8,
+            cursor: (loading || !email) ? "not-allowed" : "pointer",
+            opacity: (loading || !email) ? 0.5 : 1, fontFamily: "inherit",
+          }}>
+            {loading ? "טוען..." : mode === "signup" ? "הרשם" : mode === "reset" ? "שלח אימייל איפוס" : "התחבר"}
+          </button>
+        </form>
+
+        <div style={{ marginTop: 16, textAlign: "center", fontSize: 12, color: "var(--text-muted)" }}>
+          {mode === "login" && (
+            <>
+              <button onClick={() => setMode("signup")} style={{ background: "none", border: "none", color: "#0369a1", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit", fontSize: 12 }}>אין לי חשבון</button>
+              <span style={{ margin: "0 8px" }}>·</span>
+              <button onClick={() => setMode("reset")} style={{ background: "none", border: "none", color: "#0369a1", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit", fontSize: 12 }}>שכחתי סיסמה</button>
+            </>
+          )}
+          {mode === "signup" && (
+            <button onClick={() => setMode("login")} style={{ background: "none", border: "none", color: "#0369a1", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit", fontSize: 12 }}>יש לי חשבון, התחבר</button>
+          )}
+          {mode === "reset" && (
+            <button onClick={() => setMode("login")} style={{ background: "none", border: "none", color: "#0369a1", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit", fontSize: 12 }}>חזור להתחברות</button>
+          )}
+        </div>
+
+        <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid var(--border-light)", textAlign: "center" }}>
+          <button onClick={onSkip} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontFamily: "inherit", fontSize: 12 }}>
+            המשך בלי חשבון (נתונים נשמרים רק במכשיר זה)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AuthHeader({ user, onLogout, syncStatus }) {
+  const [open, setOpen] = useState(false);
+  if (!user) return null;
+  const displayName = user.displayName || user.email?.split("@")[0] || "משתמש";
+  const initial = displayName[0]?.toUpperCase() || "?";
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button onClick={() => setOpen(!open)} style={{
+        display: "flex", alignItems: "center", gap: 8,
+        padding: "4px 10px 4px 4px", background: "var(--bg-card)",
+        border: "1px solid var(--border-light)", borderRadius: 99,
+        cursor: "pointer", fontFamily: "inherit", fontSize: 12,
+        color: "var(--text-primary)",
+      }}>
+        {user.photoURL ? (
+          <img src={user.photoURL} alt="" style={{ width: 28, height: 28, borderRadius: "50%" }} />
+        ) : (
+          <div style={{ width: 28, height: 28, borderRadius: "50%", background: "var(--accent)", color: "var(--accent-text)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 600, fontSize: 13 }}>{initial}</div>
+        )}
+        <span style={{ fontWeight: 500 }}>{displayName}</span>
+      </button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 999 }} />
+          <div style={{
+            position: "absolute", top: "calc(100% + 6px)", left: 0,
+            background: "var(--bg-card)", border: "1px solid var(--border-light)",
+            borderRadius: 10, padding: 12, minWidth: 200, zIndex: 1000,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
+          }}>
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 8, direction: "ltr", textAlign: "left" }}>{user.email}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10, fontSize: 11, color: syncStatus === "synced" ? "#16a34a" : "#d97706" }}>
+              <span style={{ width: 6, height: 6, borderRadius: "50%", background: syncStatus === "synced" ? "#16a34a" : "#d97706", display: "inline-block", animation: syncStatus === "loading" ? "pulse 1s infinite" : "none" }} />
+              {syncStatus === "loading" ? "מסנכרן..." : "נתונים מסונכרנים בענן"}
+            </div>
+            <button onClick={() => { onLogout(); setOpen(false); }} style={{
+              width: "100%", padding: "8px 12px", fontSize: 13,
+              background: "var(--bg-secondary)", color: "var(--text-primary)",
+              border: "1px solid var(--border)", borderRadius: 6,
+              cursor: "pointer", fontFamily: "inherit",
+            }}>
+              התנתק
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab] = useState("scanner");
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem("dark_mode") === "1");
+  // Auth state - all hooks must be declared at the top, before any early returns
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(() => !!(typeof window !== "undefined" && window.firebase && window.location.protocol !== "file:"));
+  const [skippedLogin, setSkippedLogin] = useState(() => localStorage.getItem("skip_login") === "1");
+  const [syncStatus, setSyncStatus] = useState("");
   const [scannerState, setScannerState] = useState(() => {
     const defaults = { sector: "all", type: "momentum", result: null, error: null };
     try {
@@ -3197,6 +3615,87 @@ function App() {
     } catch {}
     return defaults;
   });
+
+  // Firebase auth listener
+  useEffect(() => {
+    if (!window.firebase || window.location.protocol === "file:") {
+      setAuthLoading(false);
+      return;
+    }
+    let unsub = null;
+    try {
+      unsub = window.firebase.auth().onAuthStateChanged(async (user) => {
+        try {
+          if (user) {
+            _currentUser = user;
+            const sessionKey = "firestore_synced_" + user.uid;
+            const alreadySynced = sessionStorage.getItem(sessionKey);
+            if (!alreadySynced) {
+              setSyncStatus("loading");
+              try {
+                const loaded = await loadFromFirestore(user.uid);
+                if (!loaded) {
+                  await syncToFirestore(user.uid);
+                }
+                sessionStorage.setItem(sessionKey, "1");
+                setSyncStatus("synced");
+                setAuthUser(user);
+                setAuthLoading(false);
+                if (loaded) {
+                  window.location.reload();
+                  return;
+                }
+              } catch (e) {
+                console.error("Sync failed:", e);
+                setSyncStatus("synced");
+                setAuthUser(user);
+                setAuthLoading(false);
+              }
+            } else {
+              setSyncStatus("synced");
+              setAuthUser(user);
+              setAuthLoading(false);
+            }
+          } else {
+            _currentUser = null;
+            setAuthUser(null);
+            setSyncStatus("");
+            for (let i = sessionStorage.length - 1; i >= 0; i--) {
+              const key = sessionStorage.key(i);
+              if (key && key.startsWith("firestore_synced_")) {
+                sessionStorage.removeItem(key);
+              }
+            }
+            setAuthLoading(false);
+          }
+        } catch (e) {
+          console.error("Auth handler error:", e);
+          setAuthLoading(false);
+        }
+      });
+    } catch (e) {
+      console.error("Firebase init failed:", e);
+      setAuthLoading(false);
+    }
+    return () => { if (unsub) unsub(); };
+  }, []);
+
+  const handleLogout = async () => {
+    if (window.firebase) {
+      try {
+        await window.firebase.auth().signOut();
+        localStorage.removeItem("skip_login");
+        setSkippedLogin(false);
+      } catch (e) {
+        console.error("Logout failed:", e);
+      }
+    }
+  };
+
+  const handleSkip = () => {
+    localStorage.setItem("skip_login", "1");
+    setSkippedLogin(true);
+  };
 
   // Persist scanner state
   useEffect(() => {
@@ -3241,6 +3740,21 @@ function App() {
   const textSecondary = darkMode ? "#94a3b8" : "#888";
   const border = darkMode ? "#334155" : "#e5e5e5";
 
+  // Loading state while checking auth (only if Firebase is active)
+  if (authLoading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 14 }}>
+        <span style={{ animation: "spin 1s linear infinite", display: "inline-block", marginLeft: 8 }}>⟳</span>
+        טוען...
+      </div>
+    );
+  }
+
+  // Show login gate if Firebase available, user not logged in, and didn't skip
+  if (window.firebase && window.location.protocol !== "file:" && !authUser && !skippedLogin) {
+    return <LoginGate onSkip={handleSkip} />;
+  }
+
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", direction: "rtl", maxWidth: 680, margin: "0 auto", padding: "16px", color: textPrimary, minHeight: "100vh" }}>
       <QueryCounter />
@@ -3252,25 +3766,28 @@ function App() {
             <div style={{ fontSize: 13, color: textSecondary }}>ניתוח מניות בזמן אמת</div>
           </div>
         </div>
-        <button
-          onClick={() => setDarkMode(!darkMode)}
-          title={darkMode ? "מצב בהיר" : "מצב כהה"}
-          style={{
-            width: 36, height: 36,
-            borderRadius: "50%",
-            border: `1px solid ${border}`,
-            background: cardBg,
-            cursor: "pointer",
-            fontSize: 16,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transition: "all 0.2s",
-            fontFamily: "inherit",
-          }}
-        >
-          {darkMode ? "☀️" : "🌙"}
-        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {authUser && <AuthHeader user={authUser} onLogout={handleLogout} syncStatus={syncStatus} />}
+          {!authUser && skippedLogin && window.firebase && window.location.protocol !== "file:" && (
+            <button onClick={() => { localStorage.removeItem("skip_login"); setSkippedLogin(false); }} style={{
+              padding: "6px 12px", fontSize: 12, fontWeight: 500,
+              background: "var(--bg-card)", color: "var(--text-primary)",
+              border: "1px solid var(--border)", borderRadius: 99,
+              cursor: "pointer", fontFamily: "inherit",
+            }}>
+              🔐 התחבר
+            </button>
+          )}
+          <button onClick={() => setDarkMode(!darkMode)} title={darkMode ? "מצב בהיר" : "מצב כהה"} style={{
+            width: 36, height: 36, borderRadius: "50%",
+            border: `1px solid ${border}`, background: cardBg,
+            cursor: "pointer", fontSize: 16,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            transition: "all 0.2s", fontFamily: "inherit",
+          }}>
+            {darkMode ? "☀️" : "🌙"}
+          </button>
+        </div>
       </div>
 
       <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${border}`, marginBottom: 20 }}>
