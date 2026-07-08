@@ -74,7 +74,7 @@ const { useState, useEffect } = React;
 //   MINOR  = new features
 //   MAJOR  = big architectural changes
 // =====================================================================
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 
 const SECTORS = [
   { val: "all", label: "כל הסקטורים" },
@@ -1296,6 +1296,53 @@ function sliceByDepth(tickers, depth) {
   return tickers.slice(0, n);
 }
 
+// Scan source options — fixed universe vs trending from news
+const SCAN_SOURCE_OPTIONS = [
+  { val: "fixed", label: "📌 רשימה קבועה" },
+  { val: "trending", label: "🔥 הכי מדוברות בחדשות" },
+];
+
+// Mine Finnhub general market news (~100 latest articles) and count ticker mentions.
+// Returns [{ symbol, count }, ...] sorted by mentions desc. Costs only 1 API call!
+async function fetchTrendingTickers(limit = 30) {
+  const cacheKey = "trending_tickers";
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+    if (cached && Date.now() - cached._ts < 900000) { // 15 min cache
+      return cached.data.slice(0, limit);
+    }
+  } catch {}
+
+  const news = await finnhubFetch("/news", { category: "general" });
+  const counts = {};
+  (news || []).forEach(item => {
+    const related = (item.related || "").split(",");
+    related.forEach(raw => {
+      const sym = raw.trim().toUpperCase();
+      // Keep only plain US stock tickers (skip crypto/forex like BINANCE:BTCUSDT)
+      if (sym && /^[A-Z][A-Z.]{0,5}$/.test(sym) && !sym.includes(":")) {
+        counts[sym] = (counts[sym] || 0) + 1;
+      }
+    });
+  });
+
+  const data = Object.entries(counts)
+    .map(([symbol, count]) => ({ symbol, count }))
+    .sort((a, b) => b.count - a.count);
+
+  // Fallback: if news mining found too few tickers, pad with the fixed universe
+  if (data.length < 10) {
+    const existing = new Set(data.map(d => d.symbol));
+    for (const t of STOCK_UNIVERSE.all) {
+      if (!existing.has(t)) data.push({ symbol: t, count: 0 });
+      if (data.length >= limit) break;
+    }
+  }
+
+  localStorage.setItem(cacheKey, JSON.stringify({ data, _ts: Date.now() }));
+  return data.slice(0, limit);
+}
+
 // Get US market status based on current ET time
 // Returns { status, label, color, icon, nextEvent }
 function getMarketStatus() {
@@ -1588,6 +1635,7 @@ function RadarTab() {
   });
   const [error, setError] = useState(null);
   const [depth, setDepth] = useState(() => localStorage.getItem("scan_depth") || "30");
+  const [source, setSource] = useState(() => localStorage.getItem("scan_source") || "fixed");
   const [marketCtx, setMarketCtx] = useState(() => {
     try { return JSON.parse(localStorage.getItem("market_context") || "null")?.data || null; } catch { return null; }
   });
@@ -1595,6 +1643,7 @@ function RadarTab() {
   useEffect(() => { localStorage.setItem("radar_sector", sector); }, [sector]);
   useEffect(() => { if (results) localStorage.setItem("radar_results", JSON.stringify(results)); }, [results]);
   const changeDepth = (v) => { setDepth(v); localStorage.setItem("scan_depth", v); };
+  const changeSource = (v) => { setSource(v); localStorage.setItem("scan_source", v); };
 
   // Load market context on mount
   useEffect(() => {
@@ -1616,7 +1665,15 @@ function RadarTab() {
       const ctx = await fetchMarketContext();
       setMarketCtx(ctx);
 
-      const tickers = sliceByDepth(STOCK_UNIVERSE[sector] || STOCK_UNIVERSE.all, depth);
+      let tickers;
+      if (source === "trending") {
+        setProgress("מחפש את המניות הכי מדוברות בחדשות...");
+        const wanted = depth === "all" ? 60 : (parseInt(depth) || 30);
+        const trending = await fetchTrendingTickers(wanted);
+        tickers = trending.map(t => t.symbol);
+      } else {
+        tickers = sliceByDepth(STOCK_UNIVERSE[sector] || STOCK_UNIVERSE.all, depth);
+      }
       if (!tickers.length) {
         setError("אין מניות בסקטור הזה");
         setLoading(false);
@@ -1724,8 +1781,19 @@ function RadarTab() {
         </div>
       )}
 
-      <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>סקטור לסריקה</div>
-      <Chips options={SECTORS} value={sector} onChange={setSector} />
+      <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>מקור מניות</div>
+      <Chips options={SCAN_SOURCE_OPTIONS} value={source} onChange={changeSource} />
+      {source === "trending" && (
+        <p style={{ fontSize: 11, color: "#0369a1", background: "#f0f9ff", padding: "8px 10px", borderRadius: 6, marginBottom: 12 }}>
+          🔥 המניות ייבחרו דינמית לפי כמות האזכורים בחדשות השוק האחרונות (מתעדכן כל 15 דקות)
+        </p>
+      )}
+      {source === "fixed" && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>סקטור לסריקה</div>
+          <Chips options={SECTORS} value={sector} onChange={setSector} />
+        </>
+      )}
       <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>כמות מניות לסריקה</div>
       <Chips options={SCAN_DEPTH_OPTIONS} value={depth} onChange={changeDepth} />
 
@@ -1967,19 +2035,21 @@ function ScannerTab({ state, setState }) {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState("");
   const [depth, setDepth] = useState(() => localStorage.getItem("scan_depth") || "30");
+  const [source, setSource] = useState(() => localStorage.getItem("scan_source") || "fixed");
 
   const setSector = (v) => setState((s) => ({ ...s, sector: v }));
   const setType = (v) => setState((s) => ({ ...s, type: v }));
   const setResult = (v) => setState((s) => ({ ...s, result: v }));
   const setError = (v) => setState((s) => ({ ...s, error: v }));
   const changeDepth = (v) => { setDepth(v); localStorage.setItem("scan_depth", v); };
+  const changeSource = (v) => { setSource(v); localStorage.setItem("scan_source", v); };
 
   const run = async () => {
     setLoading(true);
     setResult(null);
     setError(null);
     setProgress("מתחיל...");
-    const sectorLabel = SECTORS.find((s) => s.val === sector)?.label;
+    const sectorLabel = source === "trending" ? "🔥 הכי מדוברות בחדשות" : SECTORS.find((s) => s.val === sector)?.label;
     const typeLabel = SCAN_TYPES.find((s) => s.val === type)?.label;
 
     try {
@@ -1987,7 +2057,18 @@ function ScannerTab({ state, setState }) {
 
       if (hasFinnhub) {
         // FAST PATH: Use Finnhub for all data — 0 Claude tokens
-        const tickers = sliceByDepth(STOCK_UNIVERSE[sector] || STOCK_UNIVERSE.all, depth);
+        let tickers;
+        let trendingCounts = null;
+        if (source === "trending") {
+          setProgress("מחפש את המניות הכי מדוברות בחדשות...");
+          const wanted = depth === "all" ? 60 : (parseInt(depth) || 30);
+          const trending = await fetchTrendingTickers(wanted);
+          tickers = trending.map(t => t.symbol);
+          trendingCounts = {};
+          trending.forEach(t => { trendingCounts[t.symbol] = t.count; });
+        } else {
+          tickers = sliceByDepth(STOCK_UNIVERSE[sector] || STOCK_UNIVERSE.all, depth);
+        }
         if (!tickers || !tickers.length) {
           setError("שגיאה: לא נמצאו מניות לסקטור הזה. בחר סקטור אחר.");
           setLoading(false);
@@ -2115,6 +2196,9 @@ function ScannerTab({ state, setState }) {
           const recommendation = s.total >= 70 ? "לקנייה" : s.total >= 45 ? "להמתנה" : "להימנע";
           text += `${idx + 1}. **${s.ticker}** — ${s.data.name || ""}\n`;
           text += `   💰 $${s.data.price?.toFixed(2)} (${s.data.changePercent >= 0 ? "+" : ""}${s.data.changePercent?.toFixed(2)}%)\n`;
+          if (trendingCounts && trendingCounts[s.ticker] > 0) {
+            text += `   🔥 ${trendingCounts[s.ticker]} אזכורים בחדשות השוק\n`;
+          }
           // Show support/MA signals if this is a support scan
           if (type === "support" && s.touch) {
             s.touch.signals.forEach(sig => {
@@ -2154,8 +2238,19 @@ function ScannerTab({ state, setState }) {
   return (
     <div>
       <MarketStatusBar />
-      <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>סקטור</div>
-      <Chips options={SECTORS} value={sector} onChange={setSector} />
+      <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>מקור מניות</div>
+      <Chips options={SCAN_SOURCE_OPTIONS} value={source} onChange={changeSource} />
+      {source === "trending" && (
+        <p style={{ fontSize: 11, color: "#0369a1", background: "#f0f9ff", padding: "8px 10px", borderRadius: 6, marginBottom: 12 }}>
+          🔥 המניות ייבחרו דינמית לפי כמות האזכורים בחדשות השוק האחרונות (מתעדכן כל 15 דקות)
+        </p>
+      )}
+      {source === "fixed" && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>סקטור</div>
+          <Chips options={SECTORS} value={sector} onChange={setSector} />
+        </>
+      )}
       <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>סוג סריקה</div>
       <Chips options={SCAN_TYPES} value={type} onChange={setType} />
       <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>כמות מניות לסריקה</div>
