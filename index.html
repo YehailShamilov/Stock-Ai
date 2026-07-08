@@ -74,7 +74,7 @@ const { useState, useEffect } = React;
 //   MINOR  = new features
 //   MAJOR  = big architectural changes
 // =====================================================================
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.1";
 
 const SECTORS = [
   { val: "all", label: "כל הסקטורים" },
@@ -3384,40 +3384,64 @@ if (typeof window !== 'undefined' && !window._localStoragePatched) {
 const _clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
 let _realtimeUnsub = null;
 
+// Global sync state for UI visibility
+window._syncState = { lastSync: null, lastError: null, syncCount: 0 };
+
 async function syncToFirestore(uid) {
-  if (!window.firebase) return;
+  if (!window.firebase) {
+    console.warn("[SYNC] Firebase not available");
+    return;
+  }
   const data = {};
   for (const key of SYNC_KEYS) {
     const value = localStorage.getItem(key);
     if (value !== null) data[key] = value;
   }
+  console.log("[SYNC] Uploading to Firestore...", Object.keys(data).length, "keys");
   try {
     await window.firebase.firestore().collection('users').doc(uid).set({
       data,
       updatedAt: window.firebase.firestore.FieldValue.serverTimestamp(),
       clientId: _clientId,
     }, { merge: true });
+    window._syncState.lastSync = new Date();
+    window._syncState.lastError = null;
+    window._syncState.syncCount++;
+    console.log("[SYNC] ✅ Upload successful");
+    window.dispatchEvent(new CustomEvent('sync-status-change'));
   } catch (e) {
-    console.error('Sync failed:', e);
+    window._syncState.lastError = e.message;
+    console.error('[SYNC] ❌ Upload failed:', e);
+    window.dispatchEvent(new CustomEvent('sync-status-change'));
   }
 }
 
 async function loadFromFirestore(uid) {
-  if (!window.firebase) return false;
+  if (!window.firebase) {
+    console.warn("[SYNC] Firebase not available for load");
+    return false;
+  }
+  console.log("[SYNC] Loading from Firestore...");
   try {
     const doc = await window.firebase.firestore().collection('users').doc(uid).get();
     if (doc.exists) {
       const data = doc.data().data || {};
+      console.log("[SYNC] ✅ Loaded", Object.keys(data).length, "keys from cloud");
       for (const [key, value] of Object.entries(data)) {
         if (typeof value === 'string') {
           Storage.prototype.setItem.call(localStorage, key, value);
         }
       }
+      window._syncState.lastSync = new Date();
+      window._syncState.lastError = null;
       return true;
     }
+    console.log("[SYNC] No cloud data yet (first login)");
     return false;
   } catch (e) {
-    console.error('Load failed:', e);
+    window._syncState.lastError = e.message;
+    console.error('[SYNC] ❌ Load failed:', e);
+    window.dispatchEvent(new CustomEvent('sync-status-change'));
     return false;
   }
 }
@@ -3602,9 +3626,31 @@ function LoginGate({ onSkip }) {
 
 function AuthHeader({ user, onLogout, syncStatus }) {
   const [open, setOpen] = useState(false);
+  const [syncTick, setSyncTick] = useState(0);
+  const [manualSyncing, setManualSyncing] = useState(false);
+
+  // Re-render when sync state changes
+  useEffect(() => {
+    const handler = () => setSyncTick(t => t + 1);
+    window.addEventListener('sync-status-change', handler);
+    return () => window.removeEventListener('sync-status-change', handler);
+  }, []);
+
   if (!user) return null;
   const displayName = user.displayName || user.email?.split("@")[0] || "משתמש";
   const initial = displayName[0]?.toUpperCase() || "?";
+  const syncState = window._syncState || {};
+  const lastSyncStr = syncState.lastSync
+    ? syncState.lastSync.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "טרם סונכרן";
+
+  const manualSync = async () => {
+    setManualSyncing(true);
+    try {
+      await syncToFirestore(user.uid);
+    } catch {}
+    setManualSyncing(false);
+  };
 
   return (
     <div style={{ position: "relative" }}>
@@ -3628,14 +3674,42 @@ function AuthHeader({ user, onLogout, syncStatus }) {
           <div style={{
             position: "absolute", top: "calc(100% + 6px)", left: 0,
             background: "var(--bg-card)", border: "1px solid var(--border-light)",
-            borderRadius: 10, padding: 12, minWidth: 200, zIndex: 1000,
+            borderRadius: 10, padding: 12, minWidth: 240, zIndex: 1000,
             boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
           }}>
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 8, direction: "ltr", textAlign: "left" }}>{user.email}</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10, fontSize: 11, color: syncStatus === "synced" ? "#16a34a" : "#d97706" }}>
-              <span style={{ width: 6, height: 6, borderRadius: "50%", background: syncStatus === "synced" ? "#16a34a" : "#d97706", display: "inline-block", animation: syncStatus === "loading" ? "pulse 1s infinite" : "none" }} />
-              {syncStatus === "loading" ? "מסנכרן..." : "נתונים מסונכרנים בענן"}
+
+            {/* Sync status */}
+            <div style={{ background: "var(--bg-secondary)", borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: syncState.lastError ? "#dc2626" : "#16a34a", marginBottom: 4 }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: syncState.lastError ? "#dc2626" : "#16a34a", display: "inline-block" }} />
+                {syncState.lastError ? "שגיאת סנכרון" : "מסונכרן"}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                סנכרון אחרון: {lastSyncStr}
+              </div>
+              {syncState.syncCount > 0 && (
+                <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                  העלאות בסשן: {syncState.syncCount}
+                </div>
+              )}
+              {syncState.lastError && (
+                <div style={{ fontSize: 10, color: "#dc2626", marginTop: 4, direction: "ltr", textAlign: "left", wordBreak: "break-all" }}>
+                  {syncState.lastError}
+                </div>
+              )}
             </div>
+
+            <button onClick={manualSync} disabled={manualSyncing} style={{
+              width: "100%", padding: "8px 12px", fontSize: 13, marginBottom: 8,
+              background: "var(--accent)", color: "var(--accent-text)",
+              border: "none", borderRadius: 6,
+              cursor: manualSyncing ? "not-allowed" : "pointer", fontFamily: "inherit",
+              opacity: manualSyncing ? 0.6 : 1,
+            }}>
+              {manualSyncing ? "מסנכרן..." : "⟳ סנכרן עכשיו"}
+            </button>
+
             <button onClick={() => { onLogout(); setOpen(false); }} style={{
               width: "100%", padding: "8px 12px", fontSize: 13,
               background: "var(--bg-secondary)", color: "var(--text-primary)",
