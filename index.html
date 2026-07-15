@@ -74,7 +74,7 @@ const { useState, useEffect } = React;
 //   MINOR  = new features
 //   MAJOR  = big architectural changes
 // =====================================================================
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.3.1";
 
 const SECTORS = [
   { val: "all", label: "כל הסקטורים" },
@@ -1433,12 +1433,14 @@ function getMarketStatus() {
 }
 
 // Fetch market context (VIX volatility + S&P 500 direction)
-async function fetchMarketContext() {
+async function fetchMarketContext(force = false) {
   const cacheKey = "market_context";
-  try {
-    const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
-    if (cached && Date.now() - cached._ts < 600000) return cached.data; // 10 min
-  } catch {}
+  if (!force) {
+    try {
+      const cached = JSON.parse(localStorage.getItem(cacheKey) || "null");
+      if (cached && Date.now() - cached._ts < 300000) return cached.data; // 5 min
+    } catch {}
+  }
 
   try {
     const [spy, vix] = await Promise.all([
@@ -1448,11 +1450,12 @@ async function fetchMarketContext() {
     const data = {
       spy: spy && spy.c ? { price: spy.c, change: spy.d, changePercent: spy.dp } : null,
       vix: vix && vix.c ? { price: vix.c, change: vix.d, changePercent: vix.dp } : null,
+      _ts: Date.now(),
     };
     localStorage.setItem(cacheKey, JSON.stringify({ data, _ts: Date.now() }));
     return data;
   } catch {
-    return { spy: null, vix: null };
+    return { spy: null, vix: null, _ts: Date.now() };
   }
 }
 
@@ -1645,10 +1648,22 @@ function RadarTab() {
   const changeDepth = (v) => { setDepth(v); localStorage.setItem("scan_depth", v); };
   const changeSource = (v) => { setSource(v); localStorage.setItem("scan_source", v); };
 
-  // Load market context on mount
+  // Load market context on mount + auto-refresh every 2 minutes while radar is open
+  const [ctxLoading, setCtxLoading] = useState(false);
+  const refreshCtx = async (force) => {
+    if (!getFinnhubKey()) return;
+    setCtxLoading(true);
+    try {
+      const c = await fetchMarketContext(force);
+      setMarketCtx(c);
+    } catch {}
+    setCtxLoading(false);
+  };
   useEffect(() => {
     if (!getFinnhubKey()) return;
-    fetchMarketContext().then(setMarketCtx).catch(() => {});
+    refreshCtx(false);
+    const iv = setInterval(() => refreshCtx(true), 120000); // every 2 min
+    return () => clearInterval(iv);
   }, []);
 
   const run = async () => {
@@ -1736,13 +1751,14 @@ function RadarTab() {
     setProgress("");
   };
 
-  // VIX status interpretation
-  const vixLevel = marketCtx?.vix?.price;
-  const vixMood = !vixLevel ? "—" :
-                  vixLevel < 15 ? { text: "רגוע 🟢", color: "#16a34a" } :
-                  vixLevel < 20 ? { text: "תקין 🟡", color: "#d97706" } :
-                  vixLevel < 30 ? { text: "מתוח 🟠", color: "#ea580c" } :
-                                  { text: "פאניקה 🔴", color: "#dc2626" };
+  // VIXY is a fear-index ETF — its absolute price is meaningless; the daily CHANGE is what matters
+  const vixChg = marketCtx?.vix?.changePercent;
+  const vixMood = (vixChg === null || vixChg === undefined) ? { text: "—", color: "var(--text-muted)" } :
+                  vixChg > 3 ? { text: "פחד עולה 🔴", color: "#dc2626" } :
+                  vixChg > 1 ? { text: "מתיחות עולה 🟠", color: "#ea580c" } :
+                  vixChg < -3 ? { text: "נרגע מאוד 🟢", color: "#16a34a" } :
+                  vixChg < -1 ? { text: "נרגע 🟢", color: "#16a34a" } :
+                                { text: "יציב 🟡", color: "#d97706" };
 
   return (
     <div>
@@ -1751,8 +1767,30 @@ function RadarTab() {
       {/* Market context card */}
       {marketCtx && (marketCtx.spy || marketCtx.vix) && (
         <div style={{ background: "var(--bg-secondary)", border: "1px solid var(--border-light)", borderRadius: 10, padding: "10px 14px", marginBottom: 12 }}>
-          <div style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 500, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
-            🌍 הקשר שוק
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", fontWeight: 500, textTransform: "uppercase", letterSpacing: 0.5 }}>
+              🌍 הקשר שוק
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {marketCtx._ts && (
+                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                  עודכן {new Date(marketCtx._ts).toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })}
+                </span>
+              )}
+              <button
+                onClick={() => refreshCtx(true)}
+                disabled={ctxLoading}
+                title="רענן נתוני שוק"
+                style={{
+                  background: "none", border: "1px solid var(--border)", borderRadius: 6,
+                  padding: "2px 8px", fontSize: 11, cursor: ctxLoading ? "not-allowed" : "pointer",
+                  color: "var(--text-secondary)", fontFamily: "inherit",
+                  opacity: ctxLoading ? 0.5 : 1,
+                }}
+              >
+                {ctxLoading ? <span style={{ display: "inline-block", animation: "spin 1s linear infinite" }}>⟳</span> : "⟳ רענן"}
+              </button>
+            </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 12 }}>
             {marketCtx.spy && (
@@ -1768,12 +1806,15 @@ function RadarTab() {
             )}
             {marketCtx.vix && (
               <div>
-                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>VIX (VIXY)</div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>מדד פחד (VIXY)</div>
                 <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>
                   ${marketCtx.vix.price?.toFixed(2)}
+                  <span style={{ fontSize: 11, fontWeight: 500, marginRight: 5, color: (marketCtx.vix.changePercent || 0) >= 0 ? "#dc2626" : "#16a34a" }}>
+                    ({(marketCtx.vix.changePercent || 0) >= 0 ? "+" : ""}{marketCtx.vix.changePercent?.toFixed(2)}%)
+                  </span>
                 </div>
-                <div style={{ fontSize: 12, fontWeight: 500, color: vixMood.color || "var(--text-muted)" }}>
-                  {typeof vixMood === "object" ? vixMood.text : vixMood}
+                <div style={{ fontSize: 12, fontWeight: 500, color: vixMood.color }}>
+                  {vixMood.text}
                 </div>
               </div>
             )}
